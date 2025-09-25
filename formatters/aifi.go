@@ -24,13 +24,16 @@ const (
 	mainMethod string      = "main"
 )
 
-var declOrder = map[token.Token]int{
-	IMPORT: 0,
-	CONST:  1,
-	VAR:    2,
-	TYPE:   3,
-	FUNC:   4,
-}
+var (
+	declOrder = map[token.Token]int{
+		IMPORT: 0,
+		CONST:  1,
+		VAR:    2,
+		TYPE:   3,
+		FUNC:   4,
+	}
+	newline = []byte("\n")
+)
 
 type aifiFormatter struct{}
 
@@ -53,14 +56,9 @@ func (aifiFormatter) Format(filename string, src []byte) ([]byte, error) {
 		return bytes.Clone(src), nil
 	}
 
-	decls := getDecls(
-		src,
-		file.Decls,
-		file.Comments,
-		token.Pos(bytes.Index(src[file.Package:], []byte("\n"))+int(file.Package)+1))
-
-	firstDeclPos := decls[0].Pos()
-	lastDeclPos := decls[len(decls)-1].End()
+	decls := getDecls(file, src)
+	firstDeclStart := decls[0].Pos()
+	lastDeclEnd := decls[len(decls)-1].End()
 
 	slices.SortFunc(decls, func(a, b *declaration) int {
 		if a.Tok == METHOD {
@@ -82,8 +80,8 @@ func (aifiFormatter) Format(filename string, src []byte) ([]byte, error) {
 		panic(fmt.Errorf("unsupported token.Token: %v", a.Tok))
 	})
 
-	rewritten := bytes.Join(lo.Map(decls, func(decl *declaration, _ int) []byte { return decl.Text }), []byte("\n"))
-	return append(append(src[0:firstDeclPos-1], rewritten...), src[lastDeclPos:]...), nil
+	rewritten := bytes.Join(lo.Map(decls, func(decl *declaration, _ int) []byte { return decl.Text }), newline)
+	return append(append(src[0:firstDeclStart-1], rewritten...), src[lastDeclEnd:]...), nil
 }
 
 // A Go declaration, either a function/method or a general declaration (import, const, type, var).
@@ -261,26 +259,51 @@ func getDecl(src []byte, decl ast.Decl, node ast.Node, order int) *declaration {
 // Set the start of the Nth Decl to the start of the first comment block that comes after the end of the (N-1)th Decl.
 // This means multiple comment blocks between two Decls will all be prepended, in order, to the second Decl.
 // Comment blocks before the first Decl and after the last Decl are ignored.
-func getDecls(src []byte, decls []ast.Decl, comments []*ast.CommentGroup, leftBound token.Pos) []*declaration {
-	res := make([]*declaration, len(decls))
-	for i, j := 0, 0; i < len(decls); i++ {
-		for j < len(comments) && comments[j].Pos() < leftBound {
+func getDecls(file *ast.File, src []byte) []*declaration {
+	leftBound := newlinePosAfterPackageDecl(file, src)
+	if leftBound == token.NoPos {
+		leftBound = 1 // start of file
+	}
+
+	res := make([]*declaration, len(file.Decls))
+	for i, j := 0, 0; i < len(file.Decls); i++ {
+		for j < len(file.Comments) && file.Comments[j].Pos() < leftBound {
 			j++ // skip all comments before the end of the last block
 		}
 
-		node := rangeNode{start: decls[i], end: decls[i]}
-		if j < len(comments) && comments[j].Pos() < decls[i].Pos() {
-			node.start = comments[j] // attach all comment blocks before this declaration to it
+		node := rangeNode{start: file.Decls[i], end: file.Decls[i]}
+		if j < len(file.Comments) && file.Comments[j].Pos() < file.Decls[i].Pos() {
+			node.start = file.Comments[j] // attach all comment blocks before this declaration to it
 		}
 
-		res[i] = getDecl(src, decls[i], &node, i)
-		leftBound = decls[i].End()
+		res[i] = getDecl(src, file.Decls[i], &node, i)
+		leftBound = file.Decls[i].End()
 	}
 	return res
 }
 
 func isDigit(b byte) bool {
 	return b >= '0' && b <= '9'
+}
+
+// Find the position of the first newline character after the package declaration.
+// Returns token.NoPos if the package declaration is not found or if there is no newline after it.
+func newlinePosAfterPackageDecl(file *ast.File, src []byte) token.Pos {
+	if file.Name == nil {
+		return token.NoPos
+	}
+
+	// Pos is 1-based, so subtract 1 to get a 0-based index into src.
+	// Then search for the next newline after the package declaration.
+	// The declaration starts at file.Package, which is the position of the 'p' in "package".
+	// We want to find the newline after the entire package declaration line.
+	// If there are comments on the same line, we still want to include them.
+	// So we look for the first newline character after the package declaration.
+	indexOfNewlineAfterPackage := bytes.Index(src[file.Package-1:], newline)
+	if indexOfNewlineAfterPackage == -1 {
+		return token.NoPos
+	}
+	return token.Pos(indexOfNewlineAfterPackage + int(file.Package)) // +1 to convert back to 1-based position
 }
 
 // Parse a whole number starting at index i in string s.
